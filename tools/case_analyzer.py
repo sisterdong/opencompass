@@ -61,17 +61,18 @@ class BadcaseShower:
             return
 
         dataset = build_dataset_from_cfg(self.dataset_cfg)
+        if self.ds_split:
+            origin_references = dataset[self.ds_split][self.ds_column]
+        else:
+            origin_references = dataset[self.ds_column]
+        references = origin_references
         # Postprocess dataset if necessary
         if 'dataset_postprocessor' in self.eval_cfg:
-
-            def postprocess(sample):
-                s = sample[self.ds_column]
-                proc = TEXT_POSTPROCESSORS.get(
-                    self.eval_cfg['dataset_postprocessor']['type'])
-                sample[self.ds_column] = proc(s)
-                return sample
-
-            dataset = dataset.map(postprocess)
+            kwargs = self.eval_cfg['dataset_postprocessor']
+            proc = kwargs.pop('type')
+            if isinstance(proc, str):
+                proc = TEXT_POSTPROCESSORS.get(proc)
+            references = [proc(s, **kwargs) for s in origin_references]
 
         # Load predictions
         if osp.exists(osp.realpath(filename)):
@@ -87,25 +88,30 @@ class BadcaseShower:
                 for _o in range(len(_preds)):
                     preds[str(offset)] = _preds[str(_o)]
                     offset += 1
-        pred_strs = [preds[str(i)]['prediction'] for i in range(len(preds))]
-
+        origin_pred_strs = [
+            preds[str(i)]['prediction'] for i in range(len(preds))
+        ]
+        pred_list_flag = origin_pred_strs is not None and isinstance(
+            origin_pred_strs[0], list)
+        pred_strs = origin_pred_strs
         # Postprocess predictions if necessary
         if 'pred_postprocessor' in self.eval_cfg:
-            proc = TEXT_POSTPROCESSORS.get(
-                self.eval_cfg['pred_postprocessor']['type'])
-            pred_strs = [proc(s) for s in pred_strs]
-
-        if self.ds_split:
-            references = dataset[self.ds_split][self.ds_column]
-        else:
-            references = dataset[self.ds_column]
+            kwargs = self.eval_cfg['pred_postprocessor']
+            proc = kwargs.pop('type')
+            if isinstance(proc, str):
+                proc = TEXT_POSTPROCESSORS.get(proc)
+            if pred_list_flag:
+                pred_strs = [[proc(s, **kwargs) for s in preds]
+                             for preds in origin_pred_strs]
+            else:
+                pred_strs = [proc(s, **kwargs) for s in origin_pred_strs]
 
         if len(pred_strs) != len(references):
             print('length mismatch')
             return
 
         # combine cases
-        allcase, badcase = [], []
+        goodcase, badcase = [], []
         if 'in-context examples' in preds['0']:
             # ppl eval
             for i, (pred_str,
@@ -128,26 +134,31 @@ class BadcaseShower:
                     'reference': ref_str,
                     'reference_PPL': ref_PPL
                 }
+
                 if pred_str != ref_str:
                     badcase.append(item)
-                    allcase.append(item)
                 else:
-                    allcase.append(item)
+                    goodcase.append(item)
 
         else:
             # gen eval
-            for i, (pred_str,
-                    reference) in enumerate(zip(tqdm(pred_strs), references)):
+            for i, (pred_str, origin_pred_str, reference,
+                    origin_reference) in enumerate(
+                        zip(tqdm(pred_strs), origin_pred_strs, references,
+                            origin_references)):
                 ref_str = str(reference)
                 origin_prompt = preds[str(i)]['origin_prompt']
                 item = {
                     'origin_prompt': origin_prompt,
+                    'origin_prediction': origin_pred_str,
                     'prediction': pred_str,
+                    'origin_reference': origin_reference,
                     'reference': ref_str
                 }
-                # FIXME: we now consider all cases as bad cases
-                badcase.append(item)
-                allcase.append(item)
+                if pred_str != ref_str:
+                    badcase.append(item)
+                else:
+                    goodcase.append(item)
 
         # Save result
         out_path = get_infer_output_path(
@@ -159,10 +170,10 @@ class BadcaseShower:
 
         out_path = get_infer_output_path(
             self.cfg['model'], self.cfg['dataset'],
-            osp.join(self.work_dir, 'case_analysis/all'))
+            osp.join(self.work_dir, 'case_analysis/good'))
         mkdir_or_exist(osp.split(out_path)[0])
         with open(out_path, 'w', encoding='utf-8') as f:
-            json.dump(allcase, f, indent=4, ensure_ascii=False)
+            json.dump(goodcase, f, indent=4, ensure_ascii=False)
 
 
 def dispatch_tasks(cfg, force=False):
